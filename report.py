@@ -160,3 +160,33 @@ def build_report_text(fields):
             value = f"{value} (AI estimate)"
         lines.append(f"{label}: {value}")
     return "\n".join(lines)
+
+# ---------- location backstop ----------
+
+VAGUE_LOCATIONS = {
+    "here", "there", "nearby", "near me", "near here", "my area", "my place",
+    "my house", "my college", "this place", "unknown", "not provided",
+    "n/a", "na", "none",
+}
+MIN_LOCATION_LEN = 5
+
+
+def _norm(value):
+    return " ".join(str(value).lower().split()).strip(" .,-;:")
+
+
+def location_problem(location, area):
+    """Return a message if the location is too vague, else None.
+    This backs up the prompt rule that Gemini must ask for the exact location."""
+    loc = _norm(location)
+    if len(loc) < MIN_LOCATION_LEN or loc in VAGUE_LOCATIONS:
+        return (
+            "The location is too vague. Add a street, landmark, building "
+            "or junction so the authority can find the problem."
+        )
+    if loc == _norm(area):
+        return (
+            "The location is only your general area. Add a street, landmark, "
+            "building or junction so the authority can find the problem."
+        )
+    return None

@@ -11,7 +11,7 @@ from prompts import (
     WELCOME_MESSAGE_TEMPLATE,
     build_system_prompt,
 )
-from report import build_report_text, parse_report
+from report import build_report_text, location_problem, parse_report
 
 MODEL_NAME = "gemini-3.5-flash"
 MAX_PHOTO_MB = 10
@@ -32,7 +32,8 @@ def is_valid_email(value):
 
 
 def init_state():
-    """Create every session-state key once, so later stages never hit a missing key."""
+    """Create every session-state key once, so later stages never hit a missing key.
+    (report_editor is the text box's key. It only exists while a draft is shown.)"""
     defaults = {
         "onboarded": False,
         "profile": {},
@@ -49,6 +50,23 @@ def init_state():
 def reset_session():
     for key in list(st.session_state.keys()):
         del st.session_state[key]
+
+
+# --- report draft helpers: keep draft and editor box in step ---
+
+def set_report(text):
+    st.session_state.report_draft = text
+    st.session_state.report_editor = text
+
+
+def clear_report():
+    st.session_state.report_draft = ""
+    st.session_state.pop("report_editor", None)
+
+
+def reset_editor():
+    """Button callback: put Gemini's original draft back in the box."""
+    st.session_state.report_editor = st.session_state.report_draft
 
 
 @st.cache_resource
@@ -124,19 +142,19 @@ def prepare_report():
     status = result["status"]
 
     if status == "no_issue":
-        st.session_state.report_draft = ""
+        clear_report()
         st.warning(
             "No civic issue has been discussed yet. "
             "Send a photo or describe the problem first."
         )
     elif status == "no_location":
-        st.session_state.report_draft = ""
+        clear_report()
         st.warning(
             "I still need the exact location (a street, landmark, building or "
             "junction). Tell me in the chat, then press Prepare report again."
         )
     elif status == "malformed":
-        st.session_state.report_draft = ""
+        clear_report()
         st.error(
             "Gemini's reply wasn't in the expected format, so no report was "
             "created. Please press Prepare report again."
@@ -145,7 +163,7 @@ def prepare_report():
             st.text(result["raw"] or "(empty)")
             st.caption(result["problem"])
     else:
-        st.session_state.report_draft = build_report_text(result["fields"])
+        set_report(build_report_text(result["fields"]))
 
 
 # ---------- chat display ----------
@@ -179,8 +197,8 @@ def handle_input(user_input):
         st.warning(f"That photo is larger than {MAX_PHOTO_MB} MB. Please use a smaller one.")
         return
 
-    # Any new message makes an existing preview out of date.
-    st.session_state.report_draft = ""
+    # Any new message makes an existing report out of date.
+    clear_report()
 
     parts = []
     if photo is not None:
@@ -205,21 +223,55 @@ def handle_input(user_input):
         st.error(answer)
 
 
-def show_report_preview():
-    draft = st.session_state.report_draft
-    if not draft:
+def show_report_editor():
+    """Editable report box + live validation + preview."""
+    if not st.session_state.report_draft:
         return
-    result = parse_report(draft)
-    if result["status"] != "ok":
+
+    area = st.session_state.profile["area"]
+
+    st.divider()
+    st.subheader("📝 Review and edit your report")
+    st.caption(
+        "Fix anything the AI got wrong. Changes apply when you press Ctrl+Enter "
+        "or click outside the box. Chatting again or pressing Prepare report "
+        "replaces this text with a fresh draft. Nothing has been sent."
+    )
+
+    st.text_area(
+        "Report text",
+        key="report_editor",
+        height=320,
+        max_chars=12000,
+        label_visibility="collapsed",
+    )
+    st.button("↩️ Reset to AI draft", on_click=reset_editor)
+
+    result = parse_report(st.session_state.report_editor)
+    status = result["status"]
+
+    if status in ("no_issue", "no_location"):
+        st.error("This text isn't a complaint. Use Reset to AI draft to restore it.")
+        return
+    if status == "malformed":
+        st.error(
+            f"This report can't be used yet. {result['problem']} "
+            "Fix the text above, or use Reset to AI draft."
+        )
         return
 
     f = result["fields"]
-    st.divider()
-    st.subheader("📝 Report preview")
-    st.caption("This is a preview only. Nothing has been sent.")
+    problems = []
+    issue = location_problem(f["location"], area)
+    if issue:
+        problems.append(issue)
+
     for note in result["notes"]:
         st.info(note)
+    for problem in problems:
+        st.warning(problem)
 
+    st.markdown("**Preview of what will be sent**")
     col1, col2 = st.columns(2)
     col1.markdown(f"**Category:** {f['category']}")
     col2.markdown(f"**Urgency:** {f['urgency']} (AI estimate)")
@@ -228,6 +280,11 @@ def show_report_preview():
     st.markdown(f"**Description:** {f['description']}")
     st.markdown(f"**Potential risk:** {f['risk']}")
     st.markdown(f"**Requested action:** {f['action']}")
+
+    if problems:
+        st.error("Not ready yet. Fix the issue above in the text box.")
+    else:
+        st.success("✅ The report looks complete. Sending is added in Stage 7.")
 
 
 # ---------- screens ----------
@@ -343,7 +400,7 @@ def show_chat():
     )
     handle_input(user_input)
 
-    show_report_preview()
+    show_report_editor()
 
 
 # ---------- main ----------

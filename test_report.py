@@ -1,5 +1,5 @@
 # test_report.py - run with:  python test_report.py
-from report import build_report_text, parse_report
+from report import build_report_text, location_problem, parse_report
 
 GOOD = """SUBJECT: Road - Large pothole - Main gate, DKTE College
 Category: Road
@@ -112,6 +112,24 @@ def test_round_trip():
     second = parse_report(build_report_text(first["fields"]))
     assert second["status"] == "ok"
     assert second["fields"] == first["fields"]
+
+def test_location_same_as_area_is_flagged():
+    assert location_problem("Kolhapur", "Kolhapur")
+    assert location_problem("  kolhapur. ", "Kolhapur")
+
+
+def test_vague_location_is_flagged():
+    for vague in ["here", "near me", "N/A", "abc", ""]:
+        assert location_problem(vague, "Kolhapur"), vague
+
+
+def test_specific_location_is_accepted():
+    assert location_problem("Main gate, DKTE College", "Ichalkaranji") is None
+    assert location_problem("Station Road, Kolhapur", "Kolhapur") is None
+
+
+def test_marathi_location_is_accepted():
+    assert location_problem("डीकेटीई कॉलेजच्या मुख्य गेटजवळ", "Kolhapur") is None
 
 
 if __name__ == "__main__":
