@@ -6,10 +6,12 @@ from google.genai import types
 
 from prompts import (
     LANGUAGES,
+    REPORT_REQUEST_PROMPT,
     TONES,
     WELCOME_MESSAGE_TEMPLATE,
     build_system_prompt,
 )
+from report import build_report_text, parse_report
 
 MODEL_NAME = "gemini-3.5-flash"
 MAX_PHOTO_MB = 10
@@ -82,6 +84,70 @@ def ask_gemini(parts):
         return False, f"Something went wrong talking to Gemini: {error}"
 
 
+def generate_report_text():
+    """Ask Gemini for the final complaint WITHOUT touching the chat history.
+    A copy of the history plus the hidden request goes in one separate call, so
+    NO_LOCATION or the report never become part of the normal conversation."""
+    p = st.session_state.profile
+    try:
+        history = st.session_state.chat.get_history(curated=True)
+        request = types.Content(
+            role="user", parts=[types.Part(text=REPORT_REQUEST_PROMPT)]
+        )
+        reply = gemini_client.models.generate_content(
+            model=MODEL_NAME,
+            contents=list(history) + [request],
+            config=types.GenerateContentConfig(
+                system_instruction=build_system_prompt(
+                    p["tone"], p["language"], p["area"]
+                )
+            ),
+        )
+        text = (reply.text or "").strip()
+        if not text:
+            return False, "Gemini returned an empty reply. Please try again."
+        return True, text
+    except Exception as error:
+        return False, f"Something went wrong preparing the report: {error}"
+
+
+def prepare_report():
+    """Generate, parse and store the report draft, or explain what is missing."""
+    with st.spinner("Preparing your report..."):
+        ok, raw = generate_report_text()
+
+    if not ok:
+        st.error(raw)
+        return
+
+    result = parse_report(raw)
+    status = result["status"]
+
+    if status == "no_issue":
+        st.session_state.report_draft = ""
+        st.warning(
+            "No civic issue has been discussed yet. "
+            "Send a photo or describe the problem first."
+        )
+    elif status == "no_location":
+        st.session_state.report_draft = ""
+        st.warning(
+            "I still need the exact location (a street, landmark, building or "
+            "junction). Tell me in the chat, then press Prepare report again."
+        )
+    elif status == "malformed":
+        st.session_state.report_draft = ""
+        st.error(
+            "Gemini's reply wasn't in the expected format, so no report was "
+            "created. Please press Prepare report again."
+        )
+        with st.expander("What Gemini returned (for debugging)"):
+            st.text(result["raw"] or "(empty)")
+            st.caption(result["problem"])
+    else:
+        st.session_state.report_draft = build_report_text(result["fields"])
+
+
 # ---------- chat display ----------
 
 def render_message(message):
@@ -113,6 +179,9 @@ def handle_input(user_input):
         st.warning(f"That photo is larger than {MAX_PHOTO_MB} MB. Please use a smaller one.")
         return
 
+    # Any new message makes an existing preview out of date.
+    st.session_state.report_draft = ""
+
     parts = []
     if photo is not None:
         photo_bytes = photo.getvalue()
@@ -131,8 +200,34 @@ def handle_input(user_input):
 
     if ok:
         add_message("assistant", "text", answer)
+        st.rerun()  # redraw so the Prepare report button updates
     else:
         st.error(answer)
+
+
+def show_report_preview():
+    draft = st.session_state.report_draft
+    if not draft:
+        return
+    result = parse_report(draft)
+    if result["status"] != "ok":
+        return
+
+    f = result["fields"]
+    st.divider()
+    st.subheader("📝 Report preview")
+    st.caption("This is a preview only. Nothing has been sent.")
+    for note in result["notes"]:
+        st.info(note)
+
+    col1, col2 = st.columns(2)
+    col1.markdown(f"**Category:** {f['category']}")
+    col2.markdown(f"**Urgency:** {f['urgency']} (AI estimate)")
+    st.markdown(f"**Subject:** {f['subject']}")
+    st.markdown(f"**Location:** {f['location']}")
+    st.markdown(f"**Description:** {f['description']}")
+    st.markdown(f"**Potential risk:** {f['risk']}")
+    st.markdown(f"**Requested action:** {f['action']}")
 
 
 # ---------- screens ----------
@@ -219,8 +314,16 @@ def show_chat():
     ensure_chat()
     show_sidebar()
 
-    st.title("🏙️ CivicSnap")
+    header_col, button_col = st.columns([5, 2], vertical_alignment="center")
+    with header_col:
+        st.title("🏙️ CivicSnap")
+    with button_col:
+        has_user_message = any(m["role"] == "user" for m in st.session_state.messages)
+        prepare_clicked = st.button("📝 Prepare report", disabled=not has_user_message)
     st.caption(f"Reporting for {p['area']}")
+
+    if prepare_clicked:
+        prepare_report()
 
     if not st.session_state.messages:
         add_message(
@@ -239,6 +342,8 @@ def show_chat():
         max_chars=1000,
     )
     handle_input(user_input)
+
+    show_report_preview()
 
 
 # ---------- main ----------
