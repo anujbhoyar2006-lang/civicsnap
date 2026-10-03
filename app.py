@@ -15,8 +15,33 @@ from prompts import (
 )
 from report import build_report_text, location_problem, parse_report
 from safety import SAFETY_MESSAGE, find_hazards
+from limits import DailyCounter
 
 MODEL_NAME = "gemini-3.5-flash"
+MAX_CHAT_MESSAGES = 8          # Gemini chat requests per visitor session
+MAX_REPORTS = 3                # "Prepare report" presses per session
+MAX_EMAILS_PER_SESSION = 2
+MAX_EMAILS_PER_DAY = 25        # across all visitors
+
+
+def secret_flag(name, default=False):
+    """Read an optional on/off setting from secrets."""
+    try:
+        return str(st.secrets.get(name, default)).strip().lower() in ("1", "true", "yes")
+    except Exception:
+        return default
+
+
+def authority_allowed():
+    """Off unless ALLOW_AUTHORITY_EMAIL = "true" is set in secrets."""
+    return secret_flag("ALLOW_AUTHORITY_EMAIL", False)
+
+
+@st.cache_resource
+def get_email_counter():
+    """One counter for the whole app, shared by every visitor."""
+    return DailyCounter(MAX_EMAILS_PER_DAY)
+
 MAX_PHOTO_MB = 10
 DEFAULT_PHOTO_PROMPT = (
     "Here is a photo of a possible civic issue. "
@@ -45,6 +70,9 @@ def init_state():
         "messages": [],
         "report_draft": "",
         "report_id": None,
+        "chat_calls": 0,
+        "report_calls": 0,
+        "emails_sent": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -144,6 +172,13 @@ def generate_report_text():
 
 def prepare_report():
     """Generate, parse and store the report draft, or explain what is missing."""
+    if st.session_state.report_calls >= MAX_REPORTS:
+        st.warning(
+            "You've reached the report limit for this demo session. "
+            "Press Start over to begin a new one."
+        )
+        return
+    st.session_state.report_calls += 1
     with st.spinner("Preparing your report..."):
         ok, raw = generate_report_text()
 
@@ -185,7 +220,15 @@ def send_now(fields, report_text):
     if not sender or not app_password:
         st.error("Email isn't set up. Check GMAIL_ADDRESS and GMAIL_APP_PASSWORD in your secrets.")
         return
-
+    
+    if st.session_state.emails_sent >= MAX_EMAILS_PER_SESSION:
+        st.warning("You've reached the email limit for this demo session.")
+        return
+    
+    if not get_email_counter().try_take():
+        st.error("The demo has reached its daily email limit. Please try again tomorrow.")
+        return
+    
     report_id = make_report_id()
     message = build_email(
         sender,
@@ -199,6 +242,7 @@ def send_now(fields, report_text):
 
     if ok:
         st.session_state.report_id = report_id
+        st.session_state.emails_sent += 1
         st.rerun()
     else:
         st.error(error)
@@ -246,6 +290,13 @@ def handle_input(user_input):
     if photo is not None and photo.size > MAX_PHOTO_MB * 1024 * 1024:
         st.warning(f"That photo is larger than {MAX_PHOTO_MB} MB. Please use a smaller one.")
         return
+    
+    if st.session_state.chat_calls >= MAX_CHAT_MESSAGES:
+        st.warning(
+            "You've reached the message limit for this demo session. "
+            "Press Start over in the sidebar to begin a new one."
+        )
+        return
 
     # Any new message makes an existing report out of date.
     clear_report()
@@ -262,7 +313,8 @@ def handle_input(user_input):
         parts.append(text)
     else:
         parts.append(DEFAULT_PHOTO_PROMPT)
-
+        
+    st.session_state.chat_calls += 1
     with st.spinner("Looking into it..."):
         ok, answer = ask_gemini(parts)
 
@@ -396,12 +448,19 @@ def show_onboarding():
             max_chars=80,
             placeholder="e.g. Kolhapur, Shahupuri",
         )
-        authority_email = st.text_input(
-            "Authority email (optional)",
-            max_chars=100,
-            placeholder="Leave blank to send the report only to yourself",
-            help="If filled, the report goes to this address and you are copied.",
-        )
+        if authority_allowed():
+            authority_email = st.text_input(
+                "Authority email (optional)",
+                max_chars=100,
+                placeholder="Leave blank to send the report only to yourself",
+                help="If filled, the report goes to this address and you are copied.",
+            )
+        else:
+            authority_email = ""
+            st.caption(
+                "Public demo: reports are emailed only to your own address. "
+                "Sending to an authority is disabled here."
+            )
         col1, col2 = st.columns(2)
         with col1:
             tone = st.selectbox("Complaint tone", list(TONES))
