@@ -14,6 +14,7 @@ from prompts import (
     build_system_prompt,
 )
 from report import build_report_text, location_problem, parse_report
+from safety import SAFETY_MESSAGE, find_hazards
 
 MODEL_NAME = "gemini-3.5-flash"
 MAX_PHOTO_MB = 10
@@ -202,6 +203,18 @@ def send_now(fields, report_text):
     else:
         st.error(error)
 
+def show_safety_banner():
+    """Code backstop for the prompt's safety rule. Reads the user's typed text
+    and the report box, so it works even if Gemini forgets to warn."""
+    texts = [
+        m["content"]
+        for m in st.session_state.messages
+        if m["role"] == "user" and m["kind"] == "text"
+    ]
+    texts.append(st.session_state.get("report_editor", ""))
+    hazards = find_hazards("\n".join(texts))
+    if hazards:
+        st.error(SAFETY_MESSAGE.format(hazards=", ".join(hazards)))
 
 # ---------- chat display ----------
 
@@ -320,6 +333,12 @@ def show_report_editor():
         st.info(note)
     for problem in problems:
         st.warning(problem)
+        
+    if find_hazards(st.session_state.report_editor) and f["urgency"] != "High":
+        st.warning(
+            "The report mentions a possible hazard, but the urgency is "
+            f"{f['urgency']}. Consider changing the Urgency line to High (AI estimate)."
+        )
 
     st.markdown("**Preview of what will be sent**")
     col1, col2 = st.columns(2)
@@ -449,6 +468,7 @@ def show_chat():
         has_user_message = any(m["role"] == "user" for m in st.session_state.messages)
         prepare_clicked = st.button("📝 Prepare report", disabled=not has_user_message)
     st.caption(f"Reporting for {p['area']}")
+    show_safety_banner()
 
     if prepare_clicked:
         prepare_report()
@@ -472,7 +492,6 @@ def show_chat():
     handle_input(user_input)
 
     show_report_editor()
-
 
 # ---------- main ----------
 
