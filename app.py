@@ -1,9 +1,11 @@
+import hashlib
 import re
 
 import streamlit as st
 from google import genai
 from google.genai import types
 
+from mailer import build_email, make_report_id, recipients_for, send_email
 from prompts import (
     LANGUAGES,
     REPORT_REQUEST_PROMPT,
@@ -33,7 +35,8 @@ def is_valid_email(value):
 
 def init_state():
     """Create every session-state key once, so later stages never hit a missing key.
-    (report_editor is the text box's key. It only exists while a draft is shown.)"""
+    (report_editor is the text box's key. It only exists while a draft is shown.)
+    report_id is None until the current draft has been emailed."""
     defaults = {
         "onboarded": False,
         "profile": {},
@@ -57,11 +60,13 @@ def reset_session():
 def set_report(text):
     st.session_state.report_draft = text
     st.session_state.report_editor = text
+    st.session_state.report_id = None  # a new draft has not been sent
 
 
 def clear_report():
     st.session_state.report_draft = ""
     st.session_state.pop("report_editor", None)
+    st.session_state.report_id = None
 
 
 def reset_editor():
@@ -74,6 +79,13 @@ def get_gemini_client():
     """Built once and reused. Streamlit reruns the script on every click, and a
     client created as a plain variable would be rebuilt and closed each time."""
     return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+
+
+def get_gmail_credentials():
+    try:
+        return st.secrets["GMAIL_ADDRESS"], st.secrets["GMAIL_APP_PASSWORD"]
+    except Exception:
+        return None, None
 
 
 def ensure_chat():
@@ -166,6 +178,31 @@ def prepare_report():
         set_report(build_report_text(result["fields"]))
 
 
+def send_now(fields, report_text):
+    """Build and send the email. Marks the draft as sent only if Gmail accepts it."""
+    sender, app_password = get_gmail_credentials()
+    if not sender or not app_password:
+        st.error("Email isn't set up. Check GMAIL_ADDRESS and GMAIL_APP_PASSWORD in your secrets.")
+        return
+
+    report_id = make_report_id()
+    message = build_email(
+        sender,
+        st.session_state.profile,
+        fields["subject"],
+        report_text,
+        report_id,
+    )
+    with st.spinner("Sending your report..."):
+        ok, error = send_email(message, sender, app_password)
+
+    if ok:
+        st.session_state.report_id = report_id
+        st.rerun()
+    else:
+        st.error(error)
+
+
 # ---------- chat display ----------
 
 def render_message(message):
@@ -224,19 +261,31 @@ def handle_input(user_input):
 
 
 def show_report_editor():
-    """Editable report box + live validation + preview."""
+    """Editable report box + live validation + preview + confirmed send."""
     if not st.session_state.report_draft:
         return
 
-    area = st.session_state.profile["area"]
+    p = st.session_state.profile
+    sent_id = st.session_state.report_id
+    to_addr, cc_addr = recipients_for(p["email"], p["authority_email"])
 
     st.divider()
     st.subheader("📝 Review and edit your report")
-    st.caption(
-        "Fix anything the AI got wrong. Changes apply when you press Ctrl+Enter "
-        "or click outside the box. Chatting again or pressing Prepare report "
-        "replaces this text with a fresh draft. Nothing has been sent."
-    )
+
+    if sent_id:
+        copy_note = f", with a copy to `{cc_addr}`" if cc_addr else ""
+        st.success(
+            f"✅ Report **{sent_id}** was emailed to `{to_addr}`{copy_note}. "
+            "Check your inbox (and Spam). To report something else, chat again "
+            "or press Prepare report."
+        )
+    else:
+        st.caption(
+            "Fix anything the AI got wrong. Changes apply when you press Ctrl+Enter "
+            "or click outside the box. Chatting again or pressing Prepare report "
+            "replaces this text with a fresh draft. Nothing is sent until you tick "
+            "the confirmation box and press Send Report."
+        )
 
     st.text_area(
         "Report text",
@@ -244,8 +293,9 @@ def show_report_editor():
         height=320,
         max_chars=12000,
         label_visibility="collapsed",
+        disabled=bool(sent_id),
     )
-    st.button("↩️ Reset to AI draft", on_click=reset_editor)
+    st.button("↩️ Reset to AI draft", on_click=reset_editor, disabled=bool(sent_id))
 
     result = parse_report(st.session_state.report_editor)
     status = result["status"]
@@ -262,7 +312,7 @@ def show_report_editor():
 
     f = result["fields"]
     problems = []
-    issue = location_problem(f["location"], area)
+    issue = location_problem(f["location"], p["area"])
     if issue:
         problems.append(issue)
 
@@ -283,8 +333,29 @@ def show_report_editor():
 
     if problems:
         st.error("Not ready yet. Fix the issue above in the text box.")
+        return
+    if sent_id:
+        return
+
+    # ---- confirmed send: only reachable with a valid, specific report ----
+    st.success("✅ The report looks complete.")
+    if cc_addr:
+        st.info(
+            f"This report will be emailed to `{to_addr}`, "
+            f"with a copy to you (`{cc_addr}`)."
+        )
+        label = f"I have checked this report and want to email it to {to_addr}."
     else:
-        st.success("✅ The report looks complete. Sending is added in Stage 7.")
+        st.info(f"This report will be emailed only to you (`{to_addr}`).")
+        label = "I have checked this report and want to email it."
+
+    report_text = build_report_text(f)
+    # The tick belongs to this exact text: edit the report and it un-ticks itself.
+    digest = hashlib.sha1(report_text.encode("utf-8")).hexdigest()[:10]
+    confirmed = st.checkbox(label, key=f"confirm_{digest}")
+
+    if st.button("📤 Send Report", disabled=not confirmed, type="primary"):
+        send_now(f, report_text)
 
 
 # ---------- screens ----------
